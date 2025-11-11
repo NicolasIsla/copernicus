@@ -14,9 +14,11 @@ model:
   cat_emb_dim: 4
 
 train:
-  lr: 1e-4          # sin comillas
-  weight_decay: 1e-4
-  batch_size: 1
-  num_workers: 2
   device: "cuda:0"
+  epochs: 2
+  batch_size: 1
+  num_workers: 8
+  lr: 1e-4
+  weight_decay: 1e-4
   amp: true
+  ignore_bg_in_metrics: true
