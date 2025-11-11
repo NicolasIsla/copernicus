@@ -1,0 +1,6 @@
+# config/default.yaml
+
+data:
+  root: "/data/nisla/copernicus2/out"
+  processed: "/data/nisla/copernicus2/out/npz"
+  labels: "/data/nisla/copernicus2/out/labels"
