@@ -348,7 +348,18 @@ def save_metrics(outdir: str, cm: np.ndarray, metrics: Dict[str, object], class_
 
 # if __name__ == "__main__":
 #     main()
+import os
+import argparse
 import yaml
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+# importa tus utilidades ya existentes
+# from utils.dataset import SegPatchesDataset
+# from models.model_loader import load_model
+# from src.train_utils import train_one_epoch, evaluate, metrics_from_confusion, save_metrics
+# ^ ajusta imports según tu árbol real
 
 def load_config(cfg_path: str) -> dict:
     with open(cfg_path, "r") as f:
@@ -361,11 +372,20 @@ def main():
 
     cfg = load_config(args.config)
 
+    # Secciones esperadas
     paths     = cfg["paths"]
     model_cfg = cfg["model"]
     train_cfg = cfg["train"]
     outdir    = cfg.get("outdir", "runs/exp1")
     ignore_bg = cfg.get("ignore_bg_in_metrics", False)
+
+    # Casteo robusto de tipos numéricos (evita errores cuando vienen como string)
+    lr           = float(train_cfg["lr"])
+    weight_decay = float(train_cfg["weight_decay"])
+    batch_size   = int(train_cfg["batch_size"])
+    num_workers  = int(train_cfg["num_workers"])
+    epochs       = int(train_cfg["epochs"])
+    use_amp      = bool(train_cfg.get("amp", False))
 
     os.makedirs(outdir, exist_ok=True)
 
@@ -390,21 +410,22 @@ def main():
     )
 
     print(f"[DATA] train={len(ds_train)} | val={len(ds_val)} | test={len(ds_test)}")
+    print(f"[CFG] lr={lr} | weight_decay={weight_decay} | batch_size={batch_size} | num_workers={num_workers} | amp={use_amp}")
 
     dl_train = DataLoader(
-        ds_train, batch_size=train_cfg["batch_size"], shuffle=True,
-        num_workers=train_cfg["num_workers"], pin_memory=True,
-        persistent_workers=(train_cfg["num_workers"] > 0)
+        ds_train, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=(num_workers > 0)
     )
     dl_val = DataLoader(
-        ds_val, batch_size=train_cfg["batch_size"], shuffle=False,
-        num_workers=train_cfg["num_workers"], pin_memory=True,
-        persistent_workers=(train_cfg["num_workers"] > 0)
+        ds_val, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=(num_workers > 0)
     )
     dl_test = DataLoader(
-        ds_test, batch_size=train_cfg["batch_size"], shuffle=False,
-        num_workers=train_cfg["num_workers"], pin_memory=True,
-        persistent_workers=(train_cfg["num_workers"] > 0)
+        ds_test, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=(num_workers > 0)
     )
 
     # ===== modelo =====
@@ -412,33 +433,31 @@ def main():
     model = load_model(
         weights_path=model_cfg.get("weights"),  # puede ser None
         device=device,
-        num_classes=model_cfg["num_classes"],
+        num_classes=int(model_cfg["num_classes"]),
         in_channels=11,
-        cat_num_categories=model_cfg["cat_num_categories"],
-        cat_emb_dim=model_cfg["cat_emb_dim"]
+        cat_num_categories=int(model_cfg["cat_num_categories"]),
+        cat_emb_dim=int(model_cfg["cat_emb_dim"])
     )
     model.to(device)
     model.train()
 
-    optimizer = optim.AdamW(model.parameters(),
-                            lr=train_cfg["lr"],
-                            weight_decay=train_cfg["weight_decay"])
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     best_val_miou = -1.0
     best_ckpt = os.path.join(outdir, "best.pth")
 
     # ===== loop de entrenamiento =====
-    for epoch in range(1, train_cfg["epochs"] + 1):
-        print(f"\n=== Epoch {epoch}/{train_cfg['epochs']} ===")
+    for epoch in range(1, epochs + 1):
+        print(f"\n=== Epoch {epoch}/{epochs} ===")
         tr_loss = train_one_epoch(
             model, dl_train, optimizer, device,
-            num_classes=model_cfg["num_classes"], amp=train_cfg.get("amp", False)
+            num_classes=int(model_cfg["num_classes"]), amp=use_amp
         )
         print(f"train_loss: {tr_loss:.6f}")
 
         val_loss, cm_val = evaluate(
             model, dl_val, device,
-            num_classes=model_cfg["num_classes"], amp=train_cfg.get("amp", False)
+            num_classes=int(model_cfg["num_classes"]), amp=use_amp
         )
         mets_val = metrics_from_confusion(
             cm_val, ignore_classes=([0] if ignore_bg else None)
@@ -463,7 +482,7 @@ def main():
 
     test_loss, cm_test = evaluate(
         model, dl_test, device,
-        num_classes=model_cfg["num_classes"], amp=train_cfg.get("amp", False)
+        num_classes=int(model_cfg["num_classes"]), amp=use_amp
     )
     mets_test = metrics_from_confusion(
         cm_test, ignore_classes=([0] if ignore_bg else None)
