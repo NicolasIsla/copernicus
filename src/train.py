@@ -1,31 +1,33 @@
 #!/usr/bin/env python
-import os
-import csv
-import json
-import argparse
+import os, csv, json, argparse
 from typing import Optional, Dict, Tuple
-
 import numpy as np
 from PIL import Image
+from contextlib import nullcontext
 
+import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-# ------- TU DATASET -------
 from utils.dataset import SegPatchesDataset
+from models.model_loader import load_model
 
-# ------- TU LOADER DE MODELO -------
-# Debes tener en tu proyecto:
-# from model_loader import SFANet  (si lo usas directo)
-# o bien:
-from models.model_loader import load_model   # como tú mostraste
 
-# ==========================
-# Utilidades de métricas
-# ==========================
+
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    return device, local_rank
+
+def is_main_process():
+    return (not dist.is_initialized()) or dist.get_rank() == 0
 
 @torch.no_grad()
 def batch_confusion_matrix(pred: torch.Tensor, target: torch.Tensor, num_classes: int) -> torch.Tensor:
@@ -161,10 +163,14 @@ def train_one_epoch(model, loader, optimizer, device, num_classes, amp=True, cla
     return running_loss / max(1, len(loader.dataset))
 
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes, amp=True) -> Tuple[float, np.ndarray]:
+def evaluate(model, loader, device, num_classes, amp=True, use_ddp=False) -> Tuple[float, np.ndarray]:
     model.eval()
-    total_loss = 0.0
-    cm_total = torch.zeros((num_classes, num_classes), dtype=torch.int64, device="cpu")
+    total_loss = torch.tensor(0.0, device=device)
+    total_items = torch.tensor(0.0, device=device)
+
+    cm_total = torch.zeros((num_classes, num_classes), dtype=torch.int64, device=device)
+
+    autocast_ctx = torch.amp.autocast("cuda") if (amp and device.type == "cuda") else nullcontext()
 
     for batch in tqdm(loader, desc="Eval", leave=False):
         numeric, cat, label, _ = batch
@@ -172,22 +178,29 @@ def evaluate(model, loader, device, num_classes, amp=True) -> Tuple[float, np.nd
         cat     = cat.to(device, non_blocking=True)
         label   = label.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
+        with autocast_ctx:
             logits, _ = model(numeric, cat)
             loss = compute_loss(logits, label, ignore_index=-1)
 
         pred = torch.argmax(logits, dim=1).to(torch.int64)
-        cm_b = batch_confusion_matrix(pred, label, num_classes)
-        cm_total += cm_b.detach().cpu()
+        cm_b = batch_confusion_matrix(pred, label, num_classes).to(device)
 
-        total_loss += loss.item() * numeric.size(0)
+        cm_total += cm_b
+        total_loss += loss.detach() * numeric.size(0)
+        total_items += numeric.size(0)
 
         del numeric, cat, label, logits, pred, cm_b, loss
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    avg_loss = total_loss / max(1, len(loader.dataset))
-    return avg_loss, cm_total.numpy()
+    # all-reduce entre procesos
+    if use_ddp and dist.is_initialized():
+        dist.all_reduce(cm_total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_items, op=dist.ReduceOp.SUM)
+
+    avg_loss = (total_loss / torch.clamp(total_items, min=1)).item()
+    return avg_loss, cm_total.detach().cpu().numpy()
 
 def save_metrics(outdir: str, cm: np.ndarray, metrics: Dict[str, object], class_names: Optional[list] = None):
     os.makedirs(outdir, exist_ok=True)
@@ -230,136 +243,8 @@ def save_metrics(outdir: str, cm: np.ndarray, metrics: Dict[str, object], class_
     with open(os.path.join(outdir, "final_results.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
-# ==========================
-# Main
-# ==========================
 
-# def main():
-#     ap = argparse.ArgumentParser(description="Train + Val + Test for SFANet on SegPatchesDataset")
-#     # datos
-#     ap.add_argument("--train_csv", required=True, help="CSV train con columnas npz,label")
-#     ap.add_argument("--val_csv",   required=True, help="CSV val con columnas npz,label")
-#     ap.add_argument("--test_csv",  required=True, help="CSV test con columnas npz,label")
-#     ap.add_argument("--root_npz",  default=None, help="Prefijo opcional si las rutas en CSV son relativas")
-#     ap.add_argument("--root_labels", default=None, help="Prefijo opcional si las rutas en CSV son relativas")
 
-#     # modelo
-#     ap.add_argument("--weights", default=None, help="Ruta a pesos .pth para iniciar (opcional)")
-#     ap.add_argument("--num_classes", type=int, default=12)
-#     ap.add_argument("--cat_num_categories", type=int, default=15)
-#     ap.add_argument("--cat_emb_dim", type=int, default=4)
-
-#     # entrenamiento
-#     ap.add_argument("--device", default="cuda:0")
-#     ap.add_argument("--epochs", type=int, default=20)
-#     ap.add_argument("--batch_size", type=int, default=4)
-#     ap.add_argument("--num_workers", type=int, default=4)
-#     ap.add_argument("--lr", type=float, default=1e-4)
-#     ap.add_argument("--weight_decay", type=float, default=1e-4)
-#     ap.add_argument("--amp", action="store_true", help="AMP en GPU")
-#     ap.add_argument("--ignore_bg_in_metrics", action="store_true", help="Ignorar clase 0 en métricas")
-
-#     # salida
-#     ap.add_argument("--outdir", default="runs/exp1")
-#     args = ap.parse_args()
-
-#     os.makedirs(args.outdir, exist_ok=True)
-#     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-
-#     # ===== datasets & loaders =====
-#     ds_train = SegPatchesDataset(
-#         patch_index_csv=args.train_csv,
-#         root_npz=args.root_npz, root_labels=args.root_labels,
-#         verify_exists=True, augment=True
-#     )
-#     ds_val = SegPatchesDataset(
-#         patch_index_csv=args.val_csv,
-#         root_npz=args.root_npz, root_labels=args.root_labels,
-#         verify_exists=True, augment=False
-#     )
-#     ds_test = SegPatchesDataset(
-#         patch_index_csv=args.test_csv,
-#         root_npz=args.root_npz, root_labels=args.root_labels,
-#         verify_exists=True, augment=False
-#     )
-
-#     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
-#                           num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
-#     dl_val   = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False,
-#                           num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
-#     dl_test  = DataLoader(ds_test, batch_size=args.batch_size, shuffle=False,
-#                           num_workers=args.num_workers, pin_memory=True, persistent_workers=(args.num_workers > 0))
-
-#     # ===== modelo =====
-#     # usando tu load_model para crear la arquitectura; si no pasas pesos -> arranca aleatorio
-#     model = load_model(
-#         weights_path=args.weights,
-#         device=device,
-#         num_classes=args.num_classes,
-#         in_channels=11,
-#         cat_num_categories=args.cat_num_categories,
-#         cat_emb_dim=args.cat_emb_dim
-#     )
-#     model.to(device)
-#     model.train()  # aseguramos modo train
-
-#     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-#     best_val_miou = -1.0
-#     best_ckpt = os.path.join(args.outdir, "best.pth")
-
-#     # ===== loop =====
-#     for epoch in range(1, args.epochs + 1):
-#         print(f"\n=== Epoch {epoch}/{args.epochs} ===")
-#         tr_loss = train_one_epoch(model, dl_train, optimizer, device, args.num_classes, amp=args.amp)
-#         print(f"train_loss: {tr_loss:.6f}")
-
-#         val_loss, cm_val = evaluate(model, dl_val, device, args.num_classes, amp=args.amp)
-#         mets_val = metrics_from_confusion(cm_val, ignore_classes=([0] if args.ignore_bg_in_metrics else None))
-#         print(f"val_loss: {val_loss:.6f} | pixel_acc={mets_val['pixel_accuracy']:.4f} | mIoU={mets_val['mIoU']:.4f} | macro_f1={mets_val['macro_f1']:.4f}")
-
-#         # guardar mejor por mIoU
-#         if mets_val["mIoU"] > best_val_miou:
-#             best_val_miou = mets_val["mIoU"]
-#             torch.save(model.state_dict(), best_ckpt)
-#             print(f"✓ Nuevo mejor (mIoU={best_val_miou:.4f}). Guardado: {best_ckpt}")
-
-#         # guardado por época (opcional)
-#         torch.save(model.state_dict(), os.path.join(args.outdir, f"epoch_{epoch:03d}.pth"))
-
-#     # ===== eval en TEST con el MEJOR checkpoint =====
-#     if os.path.exists(best_ckpt):
-#         model.load_state_dict(torch.load(best_ckpt, map_location="cpu"))
-#         model.to(device)
-#         model.eval()
-
-#     test_loss, cm_test = evaluate(model, dl_test, device, args.num_classes, amp=args.amp)
-#     mets_test = metrics_from_confusion(cm_test, ignore_classes=([0] if args.ignore_bg_in_metrics else None))
-
-#     print("\n=== TEST (mejor checkpoint) ===")
-#     print(f"test_loss: {test_loss:.6f}")
-#     print(f"pixel_accuracy: {mets_test['pixel_accuracy']:.6f}")
-#     print(f"macro_f1:       {mets_test['macro_f1']:.6f}")
-#     print(f"weighted_f1:    {mets_test['weighted_f1']:.6f}")
-#     print(f"mIoU:           {mets_test['mIoU']:.6f}")
-#     print(f"weighted_IoU:   {mets_test['weighted_IoU']:.6f}")
-
-#     # guardar métricas/CM de test
-#     save_metrics(os.path.join(args.outdir, "test"), cm_test, mets_test, class_names=None)
-
-# if __name__ == "__main__":
-#     main()
-import os
-import argparse
-import yaml
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-
-# importa tus utilidades ya existentes
-# from utils.dataset import SegPatchesDataset
-# from models.model_loader import load_model
-# from src.train_utils import train_one_epoch, evaluate, metrics_from_confusion, save_metrics
-# ^ ajusta imports según tu árbol real
 
 def load_config(cfg_path: str) -> dict:
     with open(cfg_path, "r") as f:
@@ -371,6 +256,8 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+
+
 
     # Secciones esperadas
     paths     = cfg["paths"]
@@ -386,6 +273,12 @@ def main():
     num_workers  = int(train_cfg["num_workers"])
     epochs       = int(train_cfg["epochs"])
     use_amp      = bool(train_cfg.get("amp", False))
+
+    use_ddp = bool(train_cfg.get("ddp", False))
+    if use_ddp:
+        device, local_rank = setup_ddp()
+    else:
+        device = torch.device(train_cfg["device"] if torch.cuda.is_available() else "cpu")
 
     os.makedirs(outdir, exist_ok=True)
 
@@ -412,24 +305,34 @@ def main():
     print(f"[DATA] train={len(ds_train)} | val={len(ds_val)} | test={len(ds_test)}")
     print(f"[CFG] lr={lr} | weight_decay={weight_decay} | batch_size={batch_size} | num_workers={num_workers} | amp={use_amp}")
 
-    dl_train = DataLoader(
-        ds_train, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=(num_workers > 0)
-    )
-    dl_val = DataLoader(
-        ds_val, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=(num_workers > 0)
-    )
-    dl_test = DataLoader(
-        ds_test, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=(num_workers > 0)
-    )
+    if use_ddp:
+        train_sampler = DistributedSampler(ds_train, shuffle=True)
+        val_sampler   = DistributedSampler(ds_val, shuffle=False)
+        test_sampler  = DistributedSampler(ds_test, shuffle=False)
+    else:
+        train_sampler = val_sampler = test_sampler = None
+
+    dl_train = DataLoader(ds_train, batch_size=train_cfg["batch_size"],
+                        shuffle=(train_sampler is None),
+                        sampler=train_sampler,
+                        num_workers=train_cfg["num_workers"],
+                        pin_memory=bool(train_cfg.get("pin_memory", True)),
+                        persistent_workers=bool(train_cfg.get("persistent_workers", False)))
+
+    dl_val = DataLoader(ds_val, batch_size=train_cfg["batch_size"],
+                        shuffle=False, sampler=val_sampler,
+                        num_workers=train_cfg["num_workers"],
+                        pin_memory=bool(train_cfg.get("pin_memory", True)),
+                        persistent_workers=bool(train_cfg.get("persistent_workers", False)))
+
+    dl_test = DataLoader(ds_test, batch_size=train_cfg["batch_size"],
+                        shuffle=False, sampler=test_sampler,
+                        num_workers=train_cfg["num_workers"],
+                        pin_memory=bool(train_cfg.get("pin_memory", True)),
+                        persistent_workers=bool(train_cfg.get("persistent_workers", False)))
 
     # ===== modelo =====
-    device = torch.device(train_cfg["device"] if torch.cuda.is_available() else "cpu")
+    # device = torch.device(train_cfg["device"] if torch.cuda.is_available() else "cpu")
     model = load_model(
         weights_path=model_cfg.get("weights"),  # puede ser None
         device=device,
@@ -438,6 +341,17 @@ def main():
         cat_num_categories=int(model_cfg["cat_num_categories"]),
         cat_emb_dim=int(model_cfg["cat_emb_dim"])
     )
+
+    model.to(device)
+
+    # BatchNorm con batch pequeño: usa SyncBN o congélalo
+    if train_cfg.get("sync_bn", False):
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+    if use_ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[device.index], output_device=device.index, find_unused_parameters=False
+        )
     model.to(device)
     model.train()
 
@@ -448,55 +362,64 @@ def main():
 
     # ===== loop de entrenamiento =====
     for epoch in range(1, epochs + 1):
+        if use_ddp:
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            if isinstance(val_sampler, DistributedSampler):
+                val_sampler.set_epoch(epoch)
         print(f"\n=== Epoch {epoch}/{epochs} ===")
         tr_loss = train_one_epoch(
             model, dl_train, optimizer, device,
             num_classes=int(model_cfg["num_classes"]), amp=use_amp
         )
-        print(f"train_loss: {tr_loss:.6f}")
+        if is_main_process():
+            print(f"train_loss: {tr_loss:.6f}")
 
-        val_loss, cm_val = evaluate(
-            model, dl_val, device,
-            num_classes=int(model_cfg["num_classes"]), amp=use_amp
-        )
+        val_loss, cm_val = evaluate(model, dl_val, device, num_classes=int(model_cfg["num_classes"]),
+                            amp=use_amp, use_ddp=use_ddp)
         mets_val = metrics_from_confusion(
             cm_val, ignore_classes=([0] if ignore_bg else None)
         )
-        print(f"val_loss: {val_loss:.6f} | pixel_acc={mets_val['pixel_accuracy']:.4f} "
-              f"| mIoU={mets_val['mIoU']:.4f} | macro_f1={mets_val['macro_f1']:.4f}")
+        if is_main_process():
+            print(f"val_loss: {val_loss:.6f} | pixel_acc={mets_val['pixel_accuracy']:.4f} "
+                f"| mIoU={mets_val['mIoU']:.4f} | macro_f1={mets_val['macro_f1']:.4f}")
 
         # guarda mejor por mIoU
-        if mets_val["mIoU"] > best_val_miou:
+        if is_main_process() and mets_val["mIoU"] > best_val_miou:
             best_val_miou = mets_val["mIoU"]
-            torch.save(model.state_dict(), best_ckpt)
+            sd = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+            torch.save(sd, best_ckpt)
             print(f"✓ Nuevo mejor (mIoU={best_val_miou:.4f}). Guardado: {best_ckpt}")
 
         # opcional: checkpoint por época
-        torch.save(model.state_dict(), os.path.join(outdir, f"epoch_{epoch:03d}.pth"))
+        if is_main_process():
+            sd = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+            torch.save(sd, os.path.join(outdir, f"epoch_{epoch:03d}.pth"))
 
     # ===== eval en TEST con el mejor checkpoint =====
     if os.path.exists(best_ckpt):
-        model.load_state_dict(torch.load(best_ckpt, map_location="cpu"))
+        state = torch.load(best_ckpt, map_location="cpu")
+        (model.module if hasattr(model, "module") else model).load_state_dict(state)
         model.to(device)
         model.eval()
 
-    test_loss, cm_test = evaluate(
-        model, dl_test, device,
-        num_classes=int(model_cfg["num_classes"]), amp=use_amp
-    )
+    test_loss, cm_test = evaluate(model, dl_test, device, num_classes=int(model_cfg["num_classes"]),
+                              amp=use_amp, use_ddp=use_ddp)
     mets_test = metrics_from_confusion(
         cm_test, ignore_classes=([0] if ignore_bg else None)
     )
+    if is_main_process():
+        print("\n=== TEST (mejor checkpoint) ===")
+        print(f"test_loss:      {test_loss:.6f}")
+        print(f"pixel_accuracy: {mets_test['pixel_accuracy']:.6f}")
+        print(f"macro_f1:       {mets_test['macro_f1']:.6f}")
+        print(f"weighted_f1:    {mets_test['weighted_f1']:.6f}")
+        print(f"mIoU:           {mets_test['mIoU']:.6f}")
+        print(f"weighted_IoU:   {mets_test['weighted_IoU']:.6f}")
 
-    print("\n=== TEST (mejor checkpoint) ===")
-    print(f"test_loss:      {test_loss:.6f}")
-    print(f"pixel_accuracy: {mets_test['pixel_accuracy']:.6f}")
-    print(f"macro_f1:       {mets_test['macro_f1']:.6f}")
-    print(f"weighted_f1:    {mets_test['weighted_f1']:.6f}")
-    print(f"mIoU:           {mets_test['mIoU']:.6f}")
-    print(f"weighted_IoU:   {mets_test['weighted_IoU']:.6f}")
-
-    save_metrics(os.path.join(outdir, "test"), cm_test, mets_test, class_names=None)
+        save_metrics(os.path.join(outdir, "test"), cm_test, mets_test, class_names=None)
 
 if __name__ == "__main__":
     main()
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
