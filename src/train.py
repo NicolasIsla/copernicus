@@ -392,7 +392,7 @@ def main():
             print(f"✓ Nuevo mejor (mIoU={best_val_miou:.4f}). Guardado: {best_ckpt}")
 
         # opcional: checkpoint por época
-        if is_main_process():
+        if is_main_process() and epoch % 5 == 0:
             sd = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
             torch.save(sd, os.path.join(outdir, f"epoch_{epoch:03d}.pth"))
 
