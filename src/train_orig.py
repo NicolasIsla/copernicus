@@ -20,7 +20,7 @@ import timm
 from timm.models.layers import DropPath, trunc_normal_
 from functools import partial
 from einops import rearrange
-from arq_sfanet_2_e5 import SFANet
+from models.arq_sfanet_2_e5 import SFANet
 
 class SFANetPretrained(SFANet):
     def __init__(
