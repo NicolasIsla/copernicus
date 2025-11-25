@@ -21,6 +21,7 @@ from timm.models.layers import DropPath, trunc_normal_
 from functools import partial
 from einops import rearrange
 from models.arq_sfanet_2_e5 import SFANet
+import torch.backends.cudnn as cudnn
 
 class SFANetPretrained(SFANet):
     def __init__(
@@ -615,7 +616,17 @@ if __name__ == "__main__":
     WORKERS_TEST = 4
     BATCH_METRICAS = 4000
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # ===== Configurar dispositivo y cuDNN =====
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        cudnn.benchmark = True  # para convoluciones más rápidas
+        ngpus = torch.cuda.device_count()
+        print(f"Usando CUDA con {ngpus} GPU(s)")
+    else:
+        device = torch.device("cpu")
+        print("⚠ Entrenando en CPU")
     
     # Cargar datos (solo paths)
     BASE_DIR = "/data/nisla/copernicus2"
@@ -662,8 +673,18 @@ if __name__ == "__main__":
     )
     
     # Inicializar modelo y trainer
-    model = SFANet(in_channels=11, num_classes=12)
+    # model = SFANet(in_channels=11, num_classes=12)
     # model = SFANetPretrained(in_channels=11, num_classes=12, weights_path='best_model.pth')
+
+    base_model = SFANet(in_channels=11, num_classes=12)
+    # base_model = SFANetPretrained(in_channels=11, num_classes=12, weights_path='best_model.pth')
+
+    # Si hay más de 1 GPU, usar DataParallel
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print(f"✅ Activando DataParallel en {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(base_model)
+    else:
+        model = base_model
 
     # Usar el nuevo trainer con pesos híbridos
     trainer = BalancedTrainingManager(
@@ -677,7 +698,7 @@ if __name__ == "__main__":
 
     
     # Entrenamiento con monitoreo
-    history = trainer.train(train_loader, val_loader, epochs=100, patience=20)
+    history = trainer.train(train_loader, val_loader, epochs=1, patience=20)
     # Guardar modelo final
     torch.save(model.state_dict(), '/home/nisla/copernicus/runs/exp0/fmodel_val.pth')
     
