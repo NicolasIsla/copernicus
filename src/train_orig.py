@@ -618,7 +618,16 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Cargar datos (solo paths)
+    BASE_DIR = "/data/nisla/copernicus2"
+    # Normalizar rutas de npz y labels
     df_temp = pd.read_csv("/data/nisla/copernicus2/out/patch_index.csv")
+
+    df_temp["npz"] = df_temp["npz"].apply(
+        lambda p: p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
+    )
+    df_temp["label"] = df_temp["label"].apply(
+        lambda p: p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
+    )
     df_mapping = df_temp.sample(n=min(MAX_FILES, len(df_temp)), random_state=42)
     train_df, val_df = train_test_split(df_mapping, test_size=0.20, random_state=42)
     
