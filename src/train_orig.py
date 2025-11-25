@@ -698,7 +698,7 @@ if __name__ == "__main__":
 
     
     # Entrenamiento con monitoreo
-    history = trainer.train(train_loader, val_loader, epochs=1, patience=20)
+    history = trainer.train(train_loader, val_loader, epochs=100, patience=20)
     # Guardar modelo final
     torch.save(model.state_dict(), '/home/nisla/copernicus/runs/exp0/fmodel_val.pth')
     
