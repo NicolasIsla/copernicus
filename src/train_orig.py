@@ -612,8 +612,8 @@ if __name__ == "__main__":
     BATCH_SIZE = 6 #10 con modelo eB3, 6 con eB5
     PREFETCH = 4
     MAX_FILES = 2000
-    WORKERS_TRAIN = 12
-    WORKERS_TEST = 4
+    WORKERS_TRAIN = 0
+    WORKERS_TEST = 0
     BATCH_METRICAS = 500
     
     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
