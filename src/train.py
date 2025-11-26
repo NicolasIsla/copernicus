@@ -126,15 +126,84 @@ def metrics_from_confusion(cm: np.ndarray, ignore_classes: Optional[list] = None
 # Loop de entrenamiento / eval
 # ==========================
 
-def compute_loss(logits: torch.Tensor, target: torch.Tensor, ignore_index: int = -1, class_weights: Optional[torch.Tensor] = None):
-    """
-    CrossEntropy 2D clásica.
-    - logits: (B,C,H,W)
-    - target: (B,H,W) con ints en [0..C-1]
-    """
-    return nn.functional.cross_entropy(logits, target, weight=class_weights, ignore_index=ignore_index)
+# def compute_loss(logits: torch.Tensor, target: torch.Tensor, ignore_index: int = -1, class_weights: Optional[torch.Tensor] = None):
+#     """
+#     CrossEntropy 2D clásica.
+#     - logits: (B,C,H,W)
+#     - target: (B,H,W) con ints en [0..C-1]
+#     """
+#     return nn.functional.cross_entropy(logits, target, weight=class_weights, ignore_index=ignore_index)
 
-def train_one_epoch(model, loader, optimizer, device, num_classes, amp=True, class_weights=None):
+def confusion_aware_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    ignore_index: int = -1,
+    class_weights: Optional[torch.Tensor] = None,
+    label_smoothing: float = 0.0,
+    confusion_penalty: Optional[torch.Tensor] = None,
+    confusion_lambda: float = 0.0,
+) -> torch.Tensor:
+    """
+    CrossEntropy 2D con:
+      - label smoothing
+      - penalización por confusiones frecuentes (opcional)
+
+    logits: (B,C,H,W)
+    target: (B,H,W)
+    confusion_penalty: (C,C) con penalización[t, p] para (true=t, pred=p)
+    """
+    # CE por pixel, sin reducción
+    ce = nn.functional.cross_entropy(
+        logits,
+        target,
+        weight=class_weights,
+        ignore_index=ignore_index,
+        reduction="none",
+        label_smoothing=label_smoothing if label_smoothing > 0 else 0.0,
+    )  # (B,H,W)
+
+    # máscara de píxeles válidos
+    if ignore_index >= 0:
+        valid_mask = (target != ignore_index)
+    else:
+        valid_mask = torch.ones_like(target, dtype=torch.bool)
+
+    ce_valid = ce[valid_mask]  # (N,)
+
+    # si no hay penalización de confusión, es simplemente CE media
+    if confusion_penalty is None or confusion_lambda <= 0.0:
+        return ce_valid.mean()
+
+    # predicciones
+    pred = torch.argmax(logits, dim=1)  # (B,H,W)
+    pred_valid = pred[valid_mask]       # (N,)
+    true_valid = target[valid_mask]     # (N,)
+
+    # obtenemos penalización[t, p] para cada pixel
+    penalties = confusion_penalty[true_valid, pred_valid]  # (N,)
+
+    # no penalizar los aciertos (t == p)
+    same_mask = (true_valid == pred_valid)
+    penalties = penalties.clone()
+    penalties[same_mask] = 0.0
+
+    # loss final = CE + λ * penalty * CE
+    total = ce_valid * (1.0 + confusion_lambda * penalties)
+    return total.mean()
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    num_classes,
+    amp=True,
+    class_weights=None,
+    label_smoothing: float = 0.0,
+    confusion_penalty: Optional[torch.Tensor] = None,
+    confusion_lambda: float = 0.0,
+):
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
     running_loss = 0.0
@@ -147,8 +216,17 @@ def train_one_epoch(model, loader, optimizer, device, num_classes, amp=True, cla
 
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
-            logits, _ = model(numeric, cat)          # (B,C,H,W)
-            loss = compute_loss(logits, label, ignore_index=-1, class_weights=class_weights)
+            logits, _ = model(numeric, cat)  # (B,C,H,W)
+            loss = confusion_aware_loss(
+                logits,
+                label,
+                num_classes=num_classes,
+                ignore_index=-1,
+                class_weights=class_weights,
+                label_smoothing=label_smoothing,
+                confusion_penalty=confusion_penalty,
+                confusion_lambda=confusion_lambda,
+            )
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -163,7 +241,15 @@ def train_one_epoch(model, loader, optimizer, device, num_classes, amp=True, cla
     return running_loss / max(1, len(loader.dataset))
 
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes, amp=True, use_ddp=False) -> Tuple[float, np.ndarray]:
+def evaluate(
+    model,
+    loader,
+    device,
+    num_classes,
+    amp=True,
+    use_ddp=False,
+    label_smoothing: float = 0.0,
+    ) -> Tuple[float, np.ndarray]:
     model.eval()
     total_loss = torch.tensor(0.0, device=device)
     total_items = torch.tensor(0.0, device=device)
@@ -180,7 +266,16 @@ def evaluate(model, loader, device, num_classes, amp=True, use_ddp=False) -> Tup
 
         with autocast_ctx:
             logits, _ = model(numeric, cat)
-            loss = compute_loss(logits, label, ignore_index=-1)
+            loss = confusion_aware_loss(
+                logits,
+                label,
+                num_classes=num_classes,
+                ignore_index=-1,
+                class_weights=None,
+                label_smoothing=label_smoothing,
+                confusion_penalty=None,          # en valid no penalizamos
+                confusion_lambda=0.0,
+            )
 
         pred = torch.argmax(logits, dim=1).to(torch.int64)
         cm_b = batch_confusion_matrix(pred, label, num_classes).to(device)
@@ -267,12 +362,16 @@ def main():
     ignore_bg = cfg.get("ignore_bg_in_metrics", False)
 
     # Casteo robusto de tipos numéricos (evita errores cuando vienen como string)
-    lr           = float(train_cfg["lr"])
-    weight_decay = float(train_cfg["weight_decay"])
-    batch_size   = int(train_cfg["batch_size"])
-    num_workers  = int(train_cfg["num_workers"])
-    epochs       = int(train_cfg["epochs"])
-    use_amp      = bool(train_cfg.get("amp", False))
+    lr              = float(train_cfg["lr"])
+    weight_decay    = float(train_cfg["weight_decay"])
+    batch_size      = int(train_cfg["batch_size"])
+    num_workers     = int(train_cfg["num_workers"])
+    epochs          = int(train_cfg["epochs"])
+    use_amp         = bool(train_cfg.get("amp", False))
+    label_smoothing = float(train_cfg.get("label_smoothing", 0.0))
+
+    use_conf_penalty   = bool(train_cfg.get("use_confusion_penalty", False))
+    confusion_lambda   = float(train_cfg.get("confusion_lambda", 0.0))
 
     use_ddp = bool(train_cfg.get("ddp", False))
     if use_ddp:
@@ -295,20 +394,20 @@ def main():
         root_labels=paths.get("root_labels"),
         verify_exists=True, augment=False
     )
-    ds_test = SegPatchesDataset(
-        patch_index_csv=paths["test_csv"],
-        root_npz=paths.get("root_npz"),
-        root_labels=paths.get("root_labels"),
-        verify_exists=True, augment=False
-    )
+    # ds_test = SegPatchesDataset(
+    #     patch_index_csv=paths["test_csv"],
+    #     root_npz=paths.get("root_npz"),
+    #     root_labels=paths.get("root_labels"),
+    #     verify_exists=True, augment=False
+    # )
 
-    print(f"[DATA] train={len(ds_train)} | val={len(ds_val)} | test={len(ds_test)}")
+    print(f"[DATA] train={len(ds_train)} | val={len(ds_val)} | ")
     print(f"[CFG] lr={lr} | weight_decay={weight_decay} | batch_size={batch_size} | num_workers={num_workers} | amp={use_amp}")
 
     if use_ddp:
         train_sampler = DistributedSampler(ds_train, shuffle=True)
         val_sampler   = DistributedSampler(ds_val, shuffle=False)
-        test_sampler  = DistributedSampler(ds_test, shuffle=False)
+        # test_sampler  = DistributedSampler(ds_test, shuffle=False)
     else:
         train_sampler = val_sampler = test_sampler = None
 
@@ -325,11 +424,11 @@ def main():
                         pin_memory=bool(train_cfg.get("pin_memory", True)),
                         persistent_workers=bool(train_cfg.get("persistent_workers", False)))
 
-    dl_test = DataLoader(ds_test, batch_size=train_cfg["batch_size"],
-                        shuffle=False, sampler=test_sampler,
-                        num_workers=train_cfg["num_workers"],
-                        pin_memory=bool(train_cfg.get("pin_memory", True)),
-                        persistent_workers=bool(train_cfg.get("persistent_workers", False)))
+    # dl_test = DataLoader(ds_test, batch_size=train_cfg["batch_size"],
+    #                     shuffle=False, sampler=test_sampler,
+    #                     num_workers=train_cfg["num_workers"],
+    #                     pin_memory=bool(train_cfg.get("pin_memory", True)),
+    #                     persistent_workers=bool(train_cfg.get("persistent_workers", False)))
 
     # ===== modelo =====
     # device = torch.device(train_cfg["device"] if torch.cuda.is_available() else "cpu")
@@ -359,6 +458,7 @@ def main():
 
     best_val_miou = -1.0
     best_ckpt = os.path.join(outdir, "best.pth")
+    confusion_penalty = None  # se construirá a partir de cm_val
 
     # ===== loop de entrenamiento =====
     for epoch in range(1, epochs + 1):
@@ -370,16 +470,40 @@ def main():
         print(f"\n=== Epoch {epoch}/{epochs} ===")
         tr_loss = train_one_epoch(
             model, dl_train, optimizer, device,
-            num_classes=int(model_cfg["num_classes"]), amp=use_amp
+            num_classes=int(model_cfg["num_classes"]),
+            amp=use_amp,
+            class_weights=None,
+            label_smoothing=label_smoothing,
+            confusion_penalty=confusion_penalty,
+            confusion_lambda=(confusion_lambda if use_conf_penalty else 0.0),
         )
         if is_main_process():
             print(f"train_loss: {tr_loss:.6f}")
 
-        val_loss, cm_val = evaluate(model, dl_val, device, num_classes=int(model_cfg["num_classes"]),
-                            amp=use_amp, use_ddp=use_ddp)
+        val_loss, cm_val = evaluate(
+            model,
+            dl_val,
+            device,
+            num_classes=int(model_cfg["num_classes"]),
+            amp=use_amp,
+            use_ddp=use_ddp,
+            label_smoothing=label_smoothing,
+        )
         mets_val = metrics_from_confusion(
             cm_val, ignore_classes=([0] if ignore_bg else None)
         )
+        # === actualizar penalización por confusión frecuente ===
+        if use_conf_penalty:
+            cm_val_float = cm_val.astype(np.float64)
+            row_sums = cm_val_float.sum(axis=1, keepdims=True) + 1e-6
+            cm_norm = cm_val_float / row_sums  # prob. de predecir p dado true t
+
+            # opcional: no penalizar la diagonal (aciertos)
+            np.fill_diagonal(cm_norm, 0.0)
+
+            confusion_penalty = torch.from_numpy(cm_norm).float().to(device)
+        else:
+            confusion_penalty = None
         if is_main_process():
             print(f"val_loss: {val_loss:.6f} | pixel_acc={mets_val['pixel_accuracy']:.4f} "
                 f"| mIoU={mets_val['mIoU']:.4f} | macro_f1={mets_val['macro_f1']:.4f}")
@@ -403,13 +527,20 @@ def main():
         model.to(device)
         model.eval()
 
-    test_loss, cm_test = evaluate(model, dl_test, device, num_classes=int(model_cfg["num_classes"]),
-                              amp=use_amp, use_ddp=use_ddp)
+    test_loss, cm_test = evaluate(
+        model,
+        dl_val,
+        device,
+        num_classes=int(model_cfg["num_classes"]),
+        amp=use_amp,
+        use_ddp=use_ddp,
+        label_smoothing=label_smoothing,
+    )
     mets_test = metrics_from_confusion(
         cm_test, ignore_classes=([0] if ignore_bg else None)
     )
     if is_main_process():
-        print("\n=== TEST (mejor checkpoint) ===")
+        print("\n=== val (mejor checkpoint) ===")
         print(f"test_loss:      {test_loss:.6f}")
         print(f"pixel_accuracy: {mets_test['pixel_accuracy']:.6f}")
         print(f"macro_f1:       {mets_test['macro_f1']:.6f}")

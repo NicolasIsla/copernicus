@@ -1,0 +1,29 @@
+# configs/train_sfa.yaml
+paths:
+  train_csv: /data/nisla/copernicus2/standar_train_original/patch_index_train.csv
+  val_csv: /data/nisla/copernicus2/standar_train_original/patch_index_val.csv
+  test_csv: 
+  root_npz: /data/nisla/copernicus2
+  root_labels: /data/nisla/copernicus2
+  outdir: /home/nisla/copernicus/results/sfanet_exp1_orginal
+
+model:
+  weights: null       # o "/ruta/a/pesos.pth"
+  num_classes: 12
+  cat_num_categories: 15
+  cat_emb_dim: 4
+
+train:
+  device: "cuda:0"
+  epochs: 2
+  batch_size: 2
+  num_workers: 8
+  lr: 1e-4
+  weight_decay: 1e-4
+  amp: true
+  ignore_bg_in_metrics: true
+  label_smoothing: 0.1
+  use_confusion_penalty: true
+  confusion_lambda: 0.1
+
+
