@@ -611,7 +611,7 @@ if __name__ == "__main__":
     # Configuración
     BATCH_SIZE = 6 #10 con modelo eB3, 6 con eB5
     PREFETCH = 4
-    MAX_FILES = 1000
+    MAX_FILES = 92000
     WORKERS_TRAIN = 12
     WORKERS_TEST = 4
     BATCH_METRICAS = 4000
