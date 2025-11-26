@@ -15,7 +15,7 @@ model:
 
 train:
   device: "cuda:0"
-  epochs: 2
+  epochs: 100
   batch_size: 2
   num_workers: 8
   lr: 1e-4
