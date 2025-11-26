@@ -606,132 +606,50 @@ class BalancedTrainingManager:
             diff = pred_dist[i] - true_dist[i]
             print(f"{i:<10} {true_dist[i]:<12.4f} {pred_dist[i]:<12.4f} {diff:<12.4f}")
 
-# ==================== EJECUCIÓN PRINCIPAL CON MONITOREO ====================
-if __name__ == "__main__":
-    # Configuración
-    BATCH_SIZE = 6 #10 con modelo eB3, 6 con eB5
-    PREFETCH = 4
-    MAX_FILES = 2000
-    WORKERS_TRAIN = 0
-    WORKERS_TEST = 0
-    BATCH_METRICAS = 500
-    
-    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # ===== Configurar dispositivo y cuDNN =====
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        cudnn.benchmark = True  # para convoluciones más rápidas
-        # ngpus = torch.cuda.device_count()
-        # print(f"Usando CUDA con {ngpus} GPU(s)")
-    else:
-        device = torch.device("cpu")
-        print("⚠ Entrenando en CPU")
-    
-    # Cargar datos (solo paths)
-    BASE_DIR = "/data/nisla/copernicus2"
-    # Normalizar rutas de npz y labels
-    df_temp = pd.read_csv("/data/nisla/copernicus2/out/patch_index.csv")
+def main():
+    # ================== CONFIG ==================
+    BASE_DIR   = "/data/nisla/copernicus2"
+    INDEX_PATH = os.path.join(BASE_DIR, "out", "patch_index.csv")
 
-    df_temp["npz"] = df_temp["npz"].apply(
-        lambda p: p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
-    )
-    df_temp["label"] = df_temp["label"].apply(
-        lambda p: p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
-    )
-    df_mapping = df_temp.sample(n=min(MAX_FILES, len(df_temp)), random_state=42)
-    train_df, val_df = train_test_split(df_mapping, test_size=0.20, random_state=42)
-    
-    # Crear datasets lazy
-    train_dataset = LazySatelliteDataset(
-        train_df["npz"].tolist(), 
-        train_df["label"].tolist()
-    )
-    val_dataset = LazySatelliteDataset(
-        val_df["npz"].tolist(), 
-        val_df["label"].tolist()
-    )
-    
-    # Configurar DataLoaders optimizados
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
+    # máximo de archivos a usar (None = usar todos)
+    MAX_FILES   = 92000
+    VAL_SIZE    = 0.20   # 20% para validación
+    RANDOM_SEED = 42
+
+    # ================== CARGAR CSV ==================
+    if not os.path.exists(INDEX_PATH):
+        raise FileNotFoundError(f"No existe el archivo: {INDEX_PATH}")
+
+    df = pd.read_csv(INDEX_PATH)
+    print(f"Total rows en patch_index.csv: {len(df)}")
+
+    # ================== SAMPLE OPCIONAL ==================
+    if MAX_FILES is not None and MAX_FILES < len(df):
+        df = df.sample(n=MAX_FILES, random_state=RANDOM_SEED).reset_index(drop=True)
+        print(f"Usando solo una muestra de {len(df)} filas (MAX_FILES={MAX_FILES})")
+
+    # ================== SPLIT TRAIN / VAL ==================
+    train_df, val_df = train_test_split(
+        df,
+        test_size=VAL_SIZE,
+        random_state=RANDOM_SEED,
         shuffle=True,
-        num_workers=WORKERS_TRAIN,
-        pin_memory=True,
-        persistent_workers=False,
-        # prefetch_factor=PREFETCH
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=WORKERS_TEST,
-        pin_memory=False,
-        # persistent_workers=True
-    )
-    print(f"✅ Datasets cargados: {len(train_dataset)} train, {len(val_dataset)} val")
-    
-    # Inicializar modelo y trainer
-    # model = SFANet(in_channels=11, num_classes=12)
-    # model = SFANetPretrained(in_channels=11, num_classes=12, weights_path='best_model.pth')
-
-    base_model = SFANet(in_channels=11, num_classes=12)
-    # base_model = SFANetPretrained(in_channels=11, num_classes=12, weights_path='best_model.pth')
-
-    # Si hay más de 1 GPU, usar DataParallel
-    # if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-    #     print(f"✅ Activando DataParallel en {torch.cuda.device_count()} GPUs")
-    #     model = nn.DataParallel(base_model)
-    # else:
-    model = base_model
-
-    # Usar el nuevo trainer con pesos híbridos
-    trainer = BalancedTrainingManager(
-        model, 
-        device, 
-        num_classes=12,
-        batch_metricas=BATCH_METRICAS,
-        train_dataset=train_dataset,
-        alpha=0.4
     )
 
-    print("\n🚀 Iniciando entrenamiento con monitoreo...")
-    
-    # Entrenamiento con monitoreo
-    history = trainer.train(train_loader, val_loader, epochs=100, patience=20)
-    # Guardar modelo final
-    torch.save(model.state_dict(), '/home/nisla/copernicus/runs/exp0/fmodel_val.pth')
-    
-    # Generar reporte de rendimiento
-    print("\n📊 Performance Report:")
-    print("\n3. Tiempos promedio:")
-    print(f"   Batch train: {np.mean(trainer.batch_times['train']) if trainer.batch_times['train'] else 0:.4f}s")
-    print(f"   Transfer train: {np.mean(trainer.transfer_times['train']) if trainer.transfer_times['train'] else 0:.4f}s")
-    print(f"   Batch val: {np.mean(trainer.batch_times['val']) if trainer.batch_times['val'] else 0:.4f}s")
-    print(f"   Transfer val: {np.mean(trainer.transfer_times['val']) if trainer.transfer_times['val'] else 0:.4f}s")
-    
-    print("\n📊 Reporte Final Mejorado:")
-    final_metrics = pd.DataFrame({
-        'Clase': trainer.class_names,
-        'IOU': trainer.best_metrics['val_ious'],
-        'F1': trainer.best_metrics['val_f1s'],
-        'Peso Final': trainer.hybrid_weights.cpu().numpy()
-    })
-    print(final_metrics.to_string(index=False))
-    
-    # Mostrar distribución de predicciones vs reales
-    confusion = trainer.best_metrics['confusion']
-    pred_dist = confusion.sum(axis=0) / confusion.sum()
-    true_dist = confusion.sum(axis=1) / confusion.sum()
-    
-    print("\nDistribución de clases:")
-    print(f"{'Clase':<10} {'Real':<12} {'Predicho':<12} {'Diferencia':<12}")
-    for i in range(trainer.num_classes):
-        diff = pred_dist[i] - true_dist[i]
-        print(f"{i:<10} {true_dist[i]:<12.4f} {pred_dist[i]:<12.4f} {diff:<12.4f}")
-        
-    print("\nLos gráficos de rendimiento se han guardado en 'performance_metrics.png'")
-    print("La matriz de confusión se ha guardado en 'confusion_matrix.png'")
-    print("Los datos detallados se han guardado en 'system_stats.csv' y 'timing_metrics.csv'")
+    print(f"Filas train: {len(train_df)}")
+    print(f"Filas val  : {len(val_df)}")
+
+    # ================== GUARDAR CSV ==================
+    out_dir = "/home/nisla/copernicus/"
+    train_path = os.path.join(out_dir, "patch_index_train.csv")
+    val_path   = os.path.join(out_dir, "patch_index_val.csv")
+
+    train_df.to_csv(train_path, index=False)
+    val_df.to_csv(val_path, index=False)
+
+    print(f"\n✅ Guardado train en: {train_path}")
+    print(f"✅ Guardado val   en: {val_path}")
+
+if __name__ == "__main__":
+    main()
