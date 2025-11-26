@@ -611,10 +611,10 @@ if __name__ == "__main__":
     # Configuración
     BATCH_SIZE = 6 #10 con modelo eB3, 6 con eB5
     PREFETCH = 4
-    MAX_FILES = 92000
+    MAX_FILES = 2000
     WORKERS_TRAIN = 12
     WORKERS_TEST = 4
-    BATCH_METRICAS = 4000
+    BATCH_METRICAS = 500
     
     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -659,8 +659,8 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=WORKERS_TRAIN,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=PREFETCH
+        persistent_workers=False,
+        # prefetch_factor=PREFETCH
     )
     
     val_loader = DataLoader(
@@ -668,8 +668,8 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=WORKERS_TEST,
-        pin_memory=True,
-        persistent_workers=True
+        pin_memory=False,
+        # persistent_workers=True
     )
     print(f"✅ Datasets cargados: {len(train_dataset)} train, {len(val_dataset)} val")
     
