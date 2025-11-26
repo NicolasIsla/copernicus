@@ -622,8 +622,8 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         device = torch.device("cuda")
         cudnn.benchmark = True  # para convoluciones más rápidas
-        ngpus = torch.cuda.device_count()
-        print(f"Usando CUDA con {ngpus} GPU(s)")
+        # ngpus = torch.cuda.device_count()
+        # print(f"Usando CUDA con {ngpus} GPU(s)")
     else:
         device = torch.device("cpu")
         print("⚠ Entrenando en CPU")
@@ -671,6 +671,7 @@ if __name__ == "__main__":
         pin_memory=True,
         persistent_workers=True
     )
+    print(f"✅ Datasets cargados: {len(train_dataset)} train, {len(val_dataset)} val")
     
     # Inicializar modelo y trainer
     # model = SFANet(in_channels=11, num_classes=12)
@@ -680,11 +681,11 @@ if __name__ == "__main__":
     # base_model = SFANetPretrained(in_channels=11, num_classes=12, weights_path='best_model.pth')
 
     # Si hay más de 1 GPU, usar DataParallel
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        print(f"✅ Activando DataParallel en {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(base_model)
-    else:
-        model = base_model
+    # if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    #     print(f"✅ Activando DataParallel en {torch.cuda.device_count()} GPUs")
+    #     model = nn.DataParallel(base_model)
+    # else:
+    model = base_model
 
     # Usar el nuevo trainer con pesos híbridos
     trainer = BalancedTrainingManager(
@@ -696,6 +697,7 @@ if __name__ == "__main__":
         alpha=0.4
     )
 
+    print("\n🚀 Iniciando entrenamiento con monitoreo...")
     
     # Entrenamiento con monitoreo
     history = trainer.train(train_loader, val_loader, epochs=100, patience=20)
