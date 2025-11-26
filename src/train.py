@@ -449,7 +449,7 @@ def main():
 
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[device.index], output_device=device.index, find_unused_parameters=False
+            model, device_ids=[device.index], output_device=device.index, find_unused_parameters=True
         )
     model.to(device)
     model.train()
