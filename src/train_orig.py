@@ -641,7 +641,7 @@ def main():
     print(f"Filas val  : {len(val_df)}")
 
     # ================== GUARDAR CSV ==================
-    out_dir = "/home/nisla/copernicus/"
+    out_dir = "/data/nisla/copernicus2/"
     train_path = os.path.join(out_dir, "patch_index_train.csv")
     val_path   = os.path.join(out_dir, "patch_index_val.csv")
 
