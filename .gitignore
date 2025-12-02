@@ -4,3 +4,7 @@ TODO.txt
 .DS_Store
 .vscode/
 .venv/
+.runs/
+*.pth
+*.csv
+.json
