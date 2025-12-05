@@ -1,10 +1,11 @@
 */__pycache__
 */old
+*misc/
 TODO.txt
 .DS_Store
 .vscode/
 .venv/
-.runs/
+*runs/
 *.pth
 *.csv
 .json
